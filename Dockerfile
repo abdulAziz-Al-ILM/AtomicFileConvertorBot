@@ -1,7 +1,7 @@
 # Python asosini olamiz
 FROM python:3.10-slim
 
-# Kerakli tizim dasturlarini o'rnatamiz (LibreOffice)
+# Kerakli tizim dasturlarini o'rnatamiz (LibreOffice va PostgreSQL kutubxonalari)
 RUN apt-get update && apt-get install -y \
     libreoffice \
     libpq-dev \
@@ -18,5 +18,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Bot kodini ko'chiramiz
 COPY . .
 
-# Botni veb-server rejimida ishga tushiramiz (Click Webhook'ini ushlash uchun)
-CMD ["gunicorn", "main:app", "-w", "4", "-b", "0.0.0.0:$PORT"]
+# Botni veb-server rejimida ishga tushiramiz.
+# Bu sintaksis gunicornni $PORT muhit o'zgaruvchisiga bog'lash uchun eng ishonchli variantdir.
+CMD gunicorn main:app -w 4 -b 0.0.0.0:"$PORT"
