@@ -1,12 +1,9 @@
 # Python asosini olamiz
 FROM python:3.10-slim
 
-# Kerakli tizim dasturlarini o'rnatamiz (LibreOffice va Tesseract OCR)
+# Kerakli tizim dasturlarini o'rnatamiz (LibreOffice. Tesseract o'chirildi.)
 RUN apt-get update && apt-get install -y \
     libreoffice \
-    tesseract-ocr \
-    tesseract-ocr-eng \
-    tesseract-ocr-rus \
     libpq-dev \
     gcc \
     && rm -rf /var/lib/apt/lists/*
