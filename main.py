@@ -4,7 +4,7 @@ import asyncio
 import datetime
 import subprocess
 import json
-import hashlib
+import re # Pul yechish uchun karta raqamini tekshirishga
 
 from io import BytesIO
 import psycopg2
@@ -14,7 +14,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, LabeledPrice, PreCheckoutQuery, SuccessfulPayment
 
 # Veb-server uchun kutubxonalar
 from aiohttp import web
@@ -26,30 +26,37 @@ ADMIN_ID = int(os.getenv("ADMIN_ID"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 WEB_SERVER_HOST = '0.0.0.0'
 WEB_SERVER_PORT = int(os.environ.get("PORT", 8080))
-BASE_WEBHOOK_URL = os.getenv("BASE_WEBHOOK_URL") # https://loyihangiz-xxxx.railway.app
+BASE_WEBHOOK_URL = os.getenv("BASE_WEBHOOK_URL") 
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}"
 
-# Click Sozlamalari
-CLICK_SERVICE_ID = os.getenv("CLICK_SERVICE_ID")
-CLICK_SECRET_KEY = os.getenv("CLICK_SECRET_KEY")
+# BotFather orqali olingan Payment Token (Test/Ishchi)
+PAYMENT_TOKEN = os.getenv("PAYMENT_TOKEN")
 
 MIN_DEPOSIT_UZS = 5000 
 MIN_WITHDRAWAL_UZS = 5000 
 REFERRAL_BONUS_UZS = 500 
+CONVERSION_PRICE_PER_MB = 1300 # Har bir konvertatsiya uchun minimal narx (1MB gacha)
+
+# Agar asosiy o'zgaruvchilar yo'q bo'lsa, xato berish
+if not all([BOT_TOKEN, ADMIN_ID, DATABASE_URL, BASE_WEBHOOK_URL, PAYMENT_TOKEN]):
+    logging.error("Muhit o'zgaruvchilari to'liq kiritilmagan! Bot ishga tushirilmaydi.")
+    exit(1)
+
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 logging.basicConfig(level=logging.INFO)
 
 # --- BAZA BILAN ISHLASH (O'zgarishsiz qoldi) ---
+# ... init_db, check_reset_weekly, get_user_stat, update_stat_and_balance funksiyalari ...
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 def init_db():
-    # ... (init_db funksiyasi o'zgarishsiz qoldi) ...
     conn = get_db_connection()
     cur = conn.cursor()
+    # Foydalanuvchilar jadvali
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
@@ -59,6 +66,7 @@ def init_db():
             joined_at TIMESTAMP DEFAULT NOW()
         )
     """)
+    # Limitlar va statistika jadvali
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_stats (
             user_id BIGINT PRIMARY KEY REFERENCES users(user_id),
@@ -73,22 +81,11 @@ def init_db():
             total_spent BIGINT DEFAULT 0
         )
     """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS payments (
-            payment_id SERIAL PRIMARY KEY,
-            user_id BIGINT,
-            amount BIGINT,
-            click_transaction_id BIGINT UNIQUE,
-            status TEXT,
-            created_at TIMESTAMP DEFAULT NOW()
-        )
-    """)
     conn.commit()
     cur.close()
     conn.close()
 
 def check_reset_weekly(user_id):
-    # ... (check_reset_weekly funksiyasi o'zgarishsiz qoldi) ...
     conn = get_db_connection()
     cur = conn.cursor()
     today = datetime.date.today()
@@ -110,7 +107,6 @@ def check_reset_weekly(user_id):
     conn.close()
 
 def get_user_stat(user_id):
-    # ... (get_user_stat funksiyasi o'zgarishsiz qoldi) ...
     check_reset_weekly(user_id)
     conn = get_db_connection()
     cur = conn.cursor()
@@ -121,7 +117,6 @@ def get_user_stat(user_id):
     return stat
 
 def update_stat_and_balance(user_id, file_type, is_paid, amount=0):
-    # ... (update_stat_and_balance funksiyasi o'zgarishsiz qoldi) ...
     conn = get_db_connection()
     cur = conn.cursor()
     if not is_paid:
@@ -139,7 +134,7 @@ def update_stat_and_balance(user_id, file_type, is_paid, amount=0):
     cur.close()
     conn.close()
 
-# Balansni to'ldirish funksiyasi (Endi Click'dan kelganda ishlaydi)
+# Balansni to'ldirish funksiyasi (Referal bonusni ham o'z ichiga oladi)
 def deposit_balance(user_id, amount):
     conn = get_db_connection()
     cur = conn.cursor()
@@ -162,16 +157,18 @@ def deposit_balance(user_id, amount):
     conn.close()
     
 def calculate_price(size_mb):
-    # ... (calculate_price funksiyasi o'zgarishsiz qoldi) ...
+    # Bu funksiya avvalgi shartlarga muvofiq qayta tiklandi
+    # 20MB gacha va 20MB dan yuqori bo'lsa
     if size_mb <= 20:
+        # 1MB gacha (yoki aniqrog'i 1MB) uchun minimal 1300 UZS.
         price = (size_mb * 300) + 1000
-        if price < 1300: price = 1300
+        if price < CONVERSION_PRICE_PER_MB: 
+            price = CONVERSION_PRICE_PER_MB # 1300 UZS minimal narx
     else:
         price = (size_mb * 500) + 1000
     return int(price)
 
 async def convert_to_pdf(input_path, output_dir):
-    # ... (convert_to_pdf funksiyasi o'zgarishsiz qoldi) ...
     try:
         process = subprocess.run(
             ['soffice', '--headless', '--convert-to', 'pdf', '--outdir', output_dir, input_path],
@@ -188,101 +185,7 @@ async def convert_to_pdf(input_path, output_dir):
         return None
 
 
-# --- CLICK API FUNKSIYALARI ---
-
-# Click Hash Check
-def check_click_hash(data: dict) -> bool:
-    sign_string = f"{data.get('click_trans_id', 0)}{CLICK_SERVICE_ID}{CLICK_SECRET_KEY}{data.get('merchant_trans_id', 0)}{data.get('param1', '')}{data.get('param2', '')}{data.get('action', 0)}{data.get('sign_time', '')}"
-    
-    # Agar Request tayyorlash (0) yoki Tasdiqlash (1) bo'lsa
-    if data.get('action', 0) in [0, 1]:
-        sign_string += str(data.get('amount', 0))
-    
-    generated_sign = hashlib.sha1(sign_string.encode('utf-8')).hexdigest()
-    return generated_sign == data.get('sign_string', '')
-
-# Click Webhook Handler
-async def click_webhook(request):
-    data = await request.post()
-    
-    # 1. Hashni tekshirish
-    if not check_click_hash(data):
-        return web.json_response({'click_trans_id': data.get('click_trans_id', 0), 'merchant_trans_id': data.get('merchant_trans_id', 0), 'error': -1, 'error_note': 'SIGN CHECK FAILED!'})
-    
-    # Ma'lumotlarni olish
-    action = int(data.get('action', 0))
-    merchant_trans_id = int(data.get('merchant_trans_id', 0)) # Bu bizning user_id miz
-    click_trans_id = int(data.get('click_trans_id', 0))
-    amount = int(float(data.get('amount', 0)))
-    error = int(data.get('error', 0))
-    user_id = merchant_trans_id
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    if action == 0: # Prepare Request
-        # Bizda hamma to'lovlar yangi bo'ladi, shuning uchun faqat kiritish
-        cur.execute("INSERT INTO payments (user_id, amount, click_transaction_id, status) VALUES (%s, %s, %s, %s)",
-                    (user_id, amount, click_trans_id, 'pending'))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return web.json_response({'click_trans_id': click_trans_id, 'merchant_trans_id': merchant_trans_id, 'error': 0, 'error_note': 'Success', 'merchant_prepare_id': user_id})
-
-    elif action == 1: # Complete Request
-        
-        # 1. To'lovni bazadan topish
-        cur.execute("SELECT * FROM payments WHERE click_transaction_id = %s", (click_trans_id,))
-        payment = cur.fetchone()
-
-        if error < 0:
-            # Xato yuz berdi
-            cur.execute("UPDATE payments SET status = %s WHERE click_transaction_id = %s", ('failed', click_trans_id))
-            conn.commit()
-            cur.close()
-            conn.close()
-            return web.json_response({'click_trans_id': click_trans_id, 'merchant_trans_id': merchant_trans_id, 'error': -4, 'error_note': 'Payment failed on Click side'})
-
-        if not payment:
-            # Prepare bosqichini o'tkazib yuborgan
-            cur.close()
-            conn.close()
-            return web.json_response({'click_trans_id': click_trans_id, 'merchant_trans_id': merchant_trans_id, 'error': -6, 'error_note': 'Transaction not found in prepare step'})
-
-        if payment['status'] == 'completed':
-            # Avval tasdiqlangan
-            cur.close()
-            conn.close()
-            return web.json_response({'click_trans_id': click_trans_id, 'merchant_trans_id': merchant_trans_id, 'error': 0, 'error_note': 'Already paid'})
-
-        if payment['amount'] != amount:
-            # Summalar mos kelmadi
-            cur.execute("UPDATE payments SET status = %s WHERE click_transaction_id = %s", ('mismatch', click_trans_id))
-            conn.commit()
-            cur.close()
-            conn.close()
-            return web.json_response({'click_trans_id': click_trans_id, 'merchant_trans_id': merchant_trans_id, 'error': -2, 'error_note': 'Incorrect amount'})
-        
-        # 2. Balansni to'ldirish
-        deposit_balance(user_id, amount)
-        
-        # 3. Baza statusini yangilash
-        cur.execute("UPDATE payments SET status = %s WHERE click_transaction_id = %s", ('completed', click_trans_id))
-        conn.commit()
-
-        # 4. Foydalanuvchiga xabar berish
-        try:
-            await bot.send_message(user_id, f"✅ Balansingizga **{amount} UZS** avtomatik tarzda qo'shildi! Endi konvertatsiya xizmatidan foydalanishingiz mumkin.", parse_mode="Markdown", reply_markup=main_menu)
-        except Exception as e:
-            logging.error(f"Xabar yuborish xatosi: {e}")
-
-        cur.close()
-        conn.close()
-        return web.json_response({'click_trans_id': click_trans_id, 'merchant_trans_id': merchant_trans_id, 'error': 0, 'error_note': 'Success'})
-
-    return web.json_response({'click_trans_id': data.get('click_trans_id', 0), 'merchant_trans_id': data.get('merchant_trans_id', 0), 'error': -3, 'error_note': 'Action not supported'})
-
-# --- STATE LAR ---
+# --- STATE LAR (O'zgarishsiz qoldi) ---
 class ConvertState(StatesGroup):
     waiting_for_file = State()
 
@@ -295,11 +198,21 @@ class WithdrawState(StatesGroup):
 class BroadcastState(StatesGroup):
     waiting_for_message = State()
 
-# --- KLAVIATURALAR ---
+# --- KLAVIATURALAR (O'zgarishsiz qoldi) ---
+# ... main_menu, convert_menu, deposit_keyboard ...
+
 main_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🔄 Konvertatsiya"), KeyboardButton(text="💰 Balansim")],
         [KeyboardButton(text="🤝 Referal"), KeyboardButton(text="📢 Reklama Xizmati"), KeyboardButton(text="ℹ️ Yordam")]
+    ], resize_keyboard=True
+)
+
+convert_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="DOCX ➡️ PDF"), KeyboardButton(text="PPTX ➡️ PDF")],
+        [KeyboardButton(text="EXCEL ➡️ PDF"), KeyboardButton(text="TXT ➡️ PDF")],
+        [KeyboardButton(text="🔙 Bosh menyu")]
     ], resize_keyboard=True
 )
 
@@ -311,9 +224,79 @@ deposit_keyboard = ReplyKeyboardMarkup(
 )
 
 # --- HANDLERLAR (ADMIN) ---
-# ... (Admin withdraw check handleri o'zgarishsiz qoldi) ...
+
+@dp.message(Command("admin"))
+async def admin_menu(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(user_id) FROM users")
+    user_count = cur.fetchone()['count']
+    cur.close()
+    conn.close()
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 E'lon Yuborish", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="📊 Statistikani ko'rish", callback_data="admin_stats")]
+    ])
+    await message.answer(f"🤖 **Admin Panel**\n\nJami foydalanuvchilar soni: **{user_count}**", reply_markup=kb, parse_mode="Markdown")
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats_callback(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID: return
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT SUM(total_spent) as total_spent, SUM(total_paid_conversions) as total_conversions FROM user_stats")
+    stats = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    text = (f"📊 **Umumiy Statistika**\n"
+            f"Jami sarflangan: **{stats['total_spent'] if stats['total_spent'] else 0} UZS**\n"
+            f"Jami pullik konvertatsiyalar: **{stats['total_conversions'] if stats['total_conversions'] else 0} ta**")
+    await call.message.answer(text, parse_mode="Markdown")
+    await call.answer()
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def admin_start_broadcast(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID: return
+    await call.message.answer("E'lon uchun matn yoki rasmni yuboring:")
+    await state.set_state(BroadcastState.waiting_for_message)
+    await call.answer()
+
+@dp.message(BroadcastState.waiting_for_message)
+async def admin_send_broadcast(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+    
+    await state.clear()
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM users")
+    users = [row['user_id'] for row in cur.fetchall()]
+    cur.close()
+    conn.close()
+    
+    sent_count = 0
+    for user_id in users:
+        try:
+            if message.text:
+                await bot.send_message(user_id, message.html_text, parse_mode="HTML")
+            elif message.photo:
+                await bot.send_photo(user_id, message.photo[-1].file_id, caption=message.caption, parse_mode="HTML")
+            sent_count += 1
+            await asyncio.sleep(0.05) 
+        except Exception:
+            pass 
+            
+    await message.answer(f"✅ E'lon {sent_count} nafar foydalanuvchiga muvaffaqiyatli yuborildi.")
+
+
 @dp.message(F.reply_to_message.is_attribute('text'))
 async def admin_withdraw_check(message: types.Message):
+    # Pul yechishni qo'lda tasdiqlash
     if message.from_user.id != ADMIN_ID or not message.photo:
         return
 
@@ -347,93 +330,286 @@ async def admin_withdraw_check(message: types.Message):
         except Exception as e:
             await message.answer(f"❌ Xatolik yuz berdi: {e}")
 
-# --- HANDLERLAR (FOYDALANUVCHI) ---
+# --- HANDLERLAR (TELEGRAM PAYMENT) ---
+# Pre-Checkout Query (Foydalanuvchi to'lovni tasdiqlashdan oldingi oxirgi tekshiruv)
+@dp.pre_checkout_query(lambda query: True)
+async def pre_checkout_handler(pre_checkout_query: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+    logging.info(f"Pre-Checkout tasdiqlandi: {pre_checkout_query.from_user.id}")
 
-# Balans to'ldirish
-@dp.message(F.text == "💰 Balansim")
-async def balance_handler(message: types.Message):
-    user_stat = get_user_stat(message.from_user.id)
-    balance = user_stat['balance']
+
+# Successful Payment (Muvaffaqiyatli to'lov)
+@dp.message(F.successful_payment)
+async def successful_payment_handler(message: types.Message):
+    payment: SuccessfulPayment = message.successful_payment
     
-    text = (f"💵 <b>Balansingiz: {balance} UZS</b>\n\n"
-            "Bu mablag'ni pullik konvertatsiyalar uchun ishlatishingiz mumkin.")
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Balansni to'ldirish", callback_data="deposit_start")]
-    ])
-    await message.answer(text, reply_markup=kb, parse_mode="HTML")
-
-@dp.callback_query(F.data == "deposit_start")
-async def start_deposit(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.delete()
-    await callback.message.answer("💳 Qancha pul to'ldirmoqchisiz? Minimal to'lov summasi: 5000 UZS", reply_markup=deposit_keyboard)
-    await state.set_state(PayState.waiting_for_deposit_amount)
-    await callback.answer()
-
-# To'lov summasini kiritish va Click linkini generatsiya qilish
-@dp.message(PayState.waiting_for_deposit_amount)
-async def get_deposit_amount(message: types.Message, state: FSMContext):
-    await state.update_data(deposit_amount=None)
+    # Pul miqdorini olish (UZS da, tiyinlarda keladi, shuning uchun 100 ga bo'lamiz)
+    amount_uzs = payment.total_amount / 100 
     user_id = message.from_user.id
     
-    try:
-        if message.text in ["5000 UZS", "10000 UZS"]:
-            amount = int(message.text.split()[0])
-        elif message.text == "🔙 Bosh menyu":
-            await state.clear()
-            await message.answer("Bosh menyuga qaytildi.", reply_markup=main_menu)
-            return
-        else:
-            amount = int(message.text)
-
-        if amount < MIN_DEPOSIT_UZS:
-            await message.answer(f"❌ Minimal to'lov summasi {MIN_DEPOSIT_UZS} UZS bo'lishi kerak. Iltimos, kattaroq summa kiriting.")
-            return
-
-        # Click to'lov linkini generatsiya qilish
-        # 'merchant_trans_id' - bu bizning user_id miz
-        click_link = f"https://my.click.uz/services/pay?service_id={CLICK_SERVICE_ID}&merchant_id={CLICK_SERVICE_ID}&amount={amount}&transaction_param={user_id}"
-
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"Click orqali {amount} UZS to'lash", url=click_link)]
-        ])
-        
-        await message.answer(
-            f"💰 Balansingizni avtomatik to'ldirish uchun **{amount} UZS** miqdorini Click orqali to'lang.\n\n"
-            f"To'lovni amalga oshirishingiz bilan pul balansingizga avtomatik qo'shiladi.",
-            parse_mode="HTML",
-            reply_markup=kb
-        )
-        await state.clear() # Endi to'lov jarayoni Click tomonidan boshqariladi
-
-    except ValueError:
-        await message.answer("❌ Noto'g'ri qiymat. Iltimos, faqat raqam kiriting.")
-
-# ... (Qolgan handlerlar o'zgarishsiz qoldi) ...
-
-
-# --- BOTNI ISHGA TUSHIRISH ---
-# Webhook va Webserver ishlatish uchun 'app' kerak
-async def on_startup(dispatcher, webhook_url):
-    await bot.set_webhook(webhook_url)
+    # Balansni to'ldirish (Referal bonusni ham o'z ichiga oladi)
+    deposit_balance(user_id, int(amount_uzs))
     
+    await message.answer(
+        f"🎉 To'lov muvaffaqiyatli yakunlandi!\n"
+        f"💵 Balansingizga **{int(amount_uzs)} UZS** qo'shildi.",
+        parse_mode="Markdown",
+        reply_markup=main_menu
+    )
+    logging.info(f"Muvaffaqiyatli to'lov: User {user_id}, {amount_uzs} UZS")
+
+# --- HANDLERLAR (ASOSIY & CONVERSION) ---
+@dp.message(CommandStart())
+async def start_handler(message: types.Message):
+    user_id = message.from_user.id
+    full_name = message.from_user.full_name
+    username = message.from_user.username
+    referrer_id = None
+    
+    # Referal linkni tekshirish (masalan: /start ref_12345)
+    if message.text and len(message.text.split()) > 1:
+        param = message.text.split()[1]
+        if param.startswith("ref_") and param[4:].isdigit():
+            referrer_id = int(param[4:])
+            if referrer_id == user_id:
+                referrer_id = None
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # Foydalanuvchini bazaga qo'shish
+    cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
+    if not cur.fetchone():
+        cur.execute("""
+            INSERT INTO users (user_id, full_name, username, referrer_id) 
+            VALUES (%s, %s, %s, %s)
+        """, (user_id, full_name, username, referrer_id))
+        
+        # Statikani yaratish
+        cur.execute("INSERT INTO user_stats (user_id) VALUES (%s)", (user_id,))
+        
+        conn.commit()
+
+    cur.close()
+    conn.close()
+    
+    text = (f"Assalomu alaykum, {full_name}!\n\n"
+            "Men hujjatlaringizni DOCX, PPTX, EXCEL, TXT formatlaridan PDF formatiga o'tkazib beruvchi botman.\n"
+            "Haftada har bir turdagi faylni bir martadan **BEPUL** konvertatsiya qilishingiz mumkin.")
+    
+    await message.answer(text, reply_markup=main_menu)
+
+@dp.message(F.text == "🔄 Konvertatsiya")
+async def conversion_menu_handler(message: types.Message):
+    await message.answer("Konvertatsiya turini tanlang:", reply_markup=convert_menu)
+
+@dp.message(F.text.in_(["DOCX ➡️ PDF", "PPTX ➡️ PDF", "EXCEL ➡️ PDF", "TXT ➡️ PDF"]))
+async def ask_for_file_handler(message: types.Message, state: FSMContext):
+    file_type_map = {
+        "DOCX ➡️ PDF": ("docx", "DOCX"),
+        "PPTX ➡️ PDF": ("pptx", "PPTX"),
+        "EXCEL ➡️ PDF": ("excel", "EXCEL"),
+        "TXT ➡️ PDF": ("txt", "TXT"),
+    }
+    
+    file_key, file_name = file_type_map[message.text]
+    user_id = message.from_user.id
+    user_stat = get_user_stat(user_id)
+    
+    if user_stat[f'free_{file_key}']:
+        # Bepul limit mavjud
+        await message.answer(f"Haftalik **{file_name}** fayl uchun bepul konvertatsiya limiti mavjud.\nIltimos, faylni yuboring.")
+    else:
+        # Pullik
+        await message.answer(f"Haftalik **{file_name}** fayl uchun bepul limit tugagan.\nIltimos, konvertatsiya qilinishi kerak bo'lgan faylni yuboring. Konvertatsiya pulga amalga oshiriladi (narx hajmdan kelib chiqib hisoblanadi).")
+    
+    await state.set_state(ConvertState.waiting_for_file)
+    await state.update_data(target_file_type=file_key)
+
+
+@dp.message(ConvertState.waiting_for_file, F.document)
+async def process_file_handler(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    file_type = data['target_file_type']
+    await state.clear() 
+    
+    doc = message.document
+    file_extension = doc.file_name.split('.')[-1].lower()
+    
+    if file_extension not in [file_type]:
+        await message.answer(f"❌ Noto'g'ri fayl turi. Iltimos, **.{file_type}** fayl yuboring.", reply_markup=convert_menu)
+        return
+
+    # Fayl hajmini tekshirish (MB ga o'tkazish)
+    file_size_mb = doc.file_size / (1024 * 1024)
+    price = calculate_price(file_size_mb)
+    user_id = message.from_user.id
+    user_stat = get_user_stat(user_id)
+
+    # Bepul / Pullik variantni aniqlash
+    if user_stat[f'free_{file_type}']:
+        is_paid = False
+        status_text = "Bepul"
+    else:
+        is_paid = True
+        if user_stat['balance'] < price:
+            await message.answer(f"❌ Konvertatsiya uchun balansingizda yetarli mablag' yo'q. Bu fayl uchun **{price} UZS** kerak. Iltimos, balansni to'ldiring.", reply_markup=main_menu)
+            return
+        status_text = f"Pullik ({price} UZS balansingizdan yechiladi)"
+
+
+    await message.answer(f"⏳ Faylingizni (Hajmi: {file_size_mb:.2f} MB, Konvertatsiya: {status_text}) qayta ishlayapman...")
+
+    try:
+        # Faylni yuklab olish
+        file_info = await bot.get_file(doc.file_id)
+        downloaded_file = await bot.download_file(file_info.file_path)
+
+        # Faylni diskka yozish (soffice konvertatsiya qilishi uchun)
+        temp_dir = 'temp'
+        os.makedirs(temp_dir, exist_ok=True)
+        input_path = os.path.join(temp_dir, doc.file_name)
+        
+        with open(input_path, 'wb') as f:
+            f.write(downloaded_file.read())
+
+        # Konvertatsiya
+        output_path = await convert_to_pdf(input_path, temp_dir)
+
+        if output_path:
+            # Faylni foydalanuvchiga yuborish
+            pdf_file = FSInputFile(output_path)
+            await message.answer_document(pdf_file, caption="✅ Konvertatsiya muvaffaqiyatli yakunlandi!")
+            
+            # Balansni yangilash
+            update_stat_and_balance(user_id, file_type, is_paid, price)
+        else:
+            await message.answer("❌ Konvertatsiya amalga oshmadi. Fayl shikastlangan bo'lishi mumkin yoki ichida ma'lumot yo'q.")
+
+    except Exception as e:
+        logging.error(f"Konvertatsiya jarayonida kutilmagan xato: {e}")
+        await message.answer("❌ Serverda kutilmagan xato ro'y berdi. Keyinroq urinib ko'ring.")
+    finally:
+        # Vaqtinchalik fayllarni o'chirish
+        if 'input_path' in locals() and os.path.exists(input_path):
+            os.remove(input_path)
+        if 'output_path' in locals() and output_path and os.path.exists(output_path):
+            os.remove(output_path)
+
+
+# --- HANDLERLAR (PUL YECHISH/REFERAL) ---
+
+@dp.message(F.text == "🤝 Referal")
+async def referral_handler(message: types.Message):
+    user_id = message.from_user.id
+    user_stat = get_user_stat(user_id)
+    referral_balance = user_stat['referral_balance']
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(user_id) FROM users WHERE referrer_id = %s", (user_id,))
+    referral_count = cur.fetchone()['count']
+    cur.close()
+    conn.close()
+    
+    referral_link = f"https://t.me/{message.bot.me.username}?start=ref_{user_id}"
+    
+    text = (f"🎁 **Referal Tizim**\n\n"
+            f"Siz chaqirgan har bir do'stingiz {MIN_DEPOSIT_UZS} UZS dan ortiq to'lov qilsa, sizning referal balansingizga **{REFERRAL_BONUS_UZS} UZS** qo'shiladi.\n\n"
+            f"👤 Sizning do'stlaringiz: **{referral_count} ta**\n"
+            f"💰 Referal balansingiz: **{referral_balance} UZS**\n\n"
+            f"🔗 **Sizning referal havolangiz:**\n"
+            f"<code>{referral_link}</code>")
+            
+    kb = None
+    if referral_balance >= MIN_WITHDRAWAL_UZS:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💸 Pul Yechish", callback_data="start_withdrawal")]
+        ])
+
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+@dp.callback_query(F.data == "start_withdrawal")
+async def start_withdrawal_callback(call: types.CallbackQuery, state: FSMContext):
+    user_id = call.from_user.id
+    user_stat = get_user_stat(user_id)
+    referral_balance = user_stat['referral_balance']
+
+    if referral_balance < MIN_WITHDRAWAL_UZS:
+        await call.answer(f"Minimal yechish summasi {MIN_WITHDRAWAL_UZS} UZS.", show_alert=True)
+        return
+
+    await call.message.edit_text(
+        f"💳 Yechib olish summasi: **{referral_balance} UZS**.\n\n"
+        "Iltimos, pul o'tkazilishi kerak bo'lgan **UZCARD/HUMO karta raqamingizni (16 xona)** yuboring:", 
+        parse_mode="Markdown"
+    )
+    await state.set_state(WithdrawState.waiting_for_card)
+    await call.answer()
+
+@dp.message(WithdrawState.waiting_for_card)
+async def process_withdrawal_card(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    card_number = message.text.replace(' ', '')
+    
+    # Karta raqamini tekshirish (16 xona raqam)
+    if not re.match(r'^\d{16}$', card_number):
+        await message.answer("❌ Karta raqami noto'g'ri formatda. Iltimos, 16 xonali raqamni to'g'ri kiriting:")
+        return
+        
+    user_stat = get_user_stat(user_id)
+    amount = user_stat['referral_balance']
+    
+    if amount < MIN_WITHDRAWAL_UZS:
+        await message.answer("Pul yechish so'rovingiz eskirgan yoki balansingiz kamaygan. Bosh menyuga qayting.", reply_markup=main_menu)
+        await state.clear()
+        return
+
+    # Admin paneliga pul yechish so'rovini yuborish
+    admin_message = (f"💸 **Yangi Pul Yechish So'rovi!**\n\n"
+                     f"USER_ID: {user_id}\n"
+                     f"Foydalanuvchi: {message.from_user.full_name}\n"
+                     f"SUMMA: {amount} UZS\n"
+                     f"KARTA: <code>{card_number}</code>\n\n"
+                     f"Iltimos, pulni o'tkazing va chek rasmi bilan javob bering.")
+    
+    await bot.send_message(ADMIN_ID, admin_message, parse_mode="HTML")
+    
+    await message.answer("✅ Pul yechish so'rovingiz adminlarga yuborildi. Tez orada pulingiz o'tkaziladi. Bosh menyuga qaytildi.", reply_markup=main_menu)
+    await state.clear()
+
+# --- BOSHQA HANDLERLAR ---
+@dp.message(F.text == "ℹ️ Yordam")
+async def help_handler(message: types.Message):
+    text = ("❓ **Yordam Bo'limi**\n\n"
+            "1. **Konvertatsiya:** Konvertatsiya menyusidan kerakli turini tanlang va faylni yuboring.\n"
+            "2. **Bepul Limit:** Har bir turdan haftada bir marta bepul foydalanishingiz mumkin.\n"
+            f"3. **Pullik:** Bepul limit tugaganda, konvertatsiya **{CONVERSION_PRICE_PER_MB} UZS** dan boshlanadigan narxda amalga oshiriladi.\n"
+            "4. **Balans:** Balansingizni to'ldirib, pullik konvertatsiyalardan foydalaning.\n"
+            "5. **Referal:** Do'stlaringizni chaqirib pul ishlang, pulni kartaga yechib olishingiz mumkin.")
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(F.text == "📢 Reklama Xizmati")
+async def ads_handler(message: types.Message):
+    await message.answer("Reklama xizmatlari bo'yicha admin (@Sizning_adminingiz) bilan bog'laning.")
+
+
+# --- BOTNI ISHGA TUSHIRISH (WEBHOOK) ---
+async def on_startup(dispatcher):
+    await bot.set_webhook(WEBHOOK_URL)
+    logging.info(f"Webhook o'rnatildi: {WEBHOOK_URL}")
+
 async def on_shutdown(dispatcher):
     await bot.delete_webhook()
 
 def create_app():
-    # Bazani yaratish/yangilash
     init_db()
 
     app = web.Application()
     
-    # Click Webhook endpoint
-    app.router.add_post('/click_webhook', click_webhook)
-    
-    # Telegram Webhook endpoint
     app.router.add_post(WEBHOOK_PATH, lambda request: telegram_webhook(request, dp))
     
-    # Startup/Shutdown funksiyalarini sozlash
-    app.on_startup.append(lambda app: on_startup(dp, WEBHOOK_URL))
+    app.on_startup.append(lambda app: on_startup(dp))
     app.on_shutdown.append(lambda app: on_shutdown(dp))
     
     return app
@@ -447,7 +623,6 @@ async def telegram_webhook(request, dispatcher):
 app = create_app()
 
 if __name__ == '__main__':
-    # Lokal ishlatish uchun (Deploymentda Gunicorn ishlaydi)
     logging.warning("Starting bot in local polling mode...")
     async def start_polling():
         init_db()
