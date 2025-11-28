@@ -16,8 +16,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, LabeledPrice, PreCheckoutQuery, SuccessfulPayment
-from aiogram.dispatcher.middlewares.base import BaseMiddleware # Middleware uchun
-from typing import Callable, Awaitable, Any, Dict # Middleware uchun
+from aiogram.dispatcher.middlewares.base import BaseMiddleware 
+from typing import Callable, Awaitable, Any, Dict 
 
 # Veb-server uchun kutubxonalar
 from aiohttp import web
@@ -44,7 +44,7 @@ CONVERSION_PRICE_PER_MB = 1300
 MAX_FILE_SIZE_MB = 100  # Maksimal fayl hajmi 100 MB
 FLOOD_CONTROL_RATE = 1.0  # Bir foydalanuvchidan xabarni qabul qilish oralig'i (sekundda)
 
-# Agar asosiy o'zgaruvchilar yo'q bo'lsa, xato berish
+# Muhit o'zgaruvchilari tekshiruvi (eng muhim himoya)
 if not all([BOT_TOKEN, ADMIN_ID, DATABASE_URL, BASE_WEBHOOK_URL, PAYMENT_TOKEN]):
     logging.error("Muhit o'zgaruvchilari to'liq kiritilmagan! Bot ishga tushirilmaydi.")
     exit(1)
@@ -69,31 +69,24 @@ class AntiFloodMiddleware(BaseMiddleware):
         user_id = event.from_user.id
         current_time = time.time()
         
-        # Agar foydalanuvchi birinchi marta yozayotgan bo'lsa
         if user_id not in self.users:
             self.users[user_id] = current_time
             return await handler(event, data)
         
-        # Oxirgi xabar bilan joriy xabar o'rtasidagi farq
         time_since_last_message = current_time - self.users[user_id]
 
         if time_since_last_message < self.rate_limit:
-            # Cheklovni buzdi
             await event.answer("⚠️ Iltimos, sekinroq yozing. Bot serverini himoya qilyapmiz.")
-            return # Handler ishga tushmaydi
+            return 
         
-        # Vaqtni yangilash
         self.users[user_id] = current_time
         return await handler(event, data)
 
 dp.message.middleware(AntiFloodMiddleware())
 
-# --- BAZA BILAN ISHLASH (O'zgarishsiz qoldi) ---
-# ... get_db_connection, init_db, check_reset_weekly, get_user_stat, update_stat_and_balance funksiyalari ...
+# --- BAZA BILAN ISHLASH FUNKSIYALARI ---
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-# ... [Qolgan barcha funksiyalar (init_db, check_reset_weekly, get_user_stat, update_stat_and_balance, deposit_balance, calculate_price, convert_to_pdf) avvalgi kod bilan bir xil joylashadi] ...
-# Bu yerga avvalgi kodning barcha funksiyalarini joylashtiring.
 
 def init_db():
     conn = get_db_connection()
@@ -204,6 +197,7 @@ def calculate_price(size_mb):
 
 async def convert_to_pdf(input_path, output_dir):
     try:
+        # LibreOffice/soffice konvertatsiyasi
         process = subprocess.run(
             ['soffice', '--headless', '--convert-to', 'pdf', '--outdir', output_dir, input_path],
             stdout=subprocess.PIPE,
@@ -213,14 +207,14 @@ async def convert_to_pdf(input_path, output_dir):
             filename = os.path.basename(input_path)
             pdf_filename = filename.rsplit('.', 1)[0] + '.pdf'
             return os.path.join(output_dir, pdf_filename)
+        # Agar xato bo'lsa, loglarga yozish
+        logging.error(f"Soffice xato kodi: {process.returncode}, Stderr: {process.stderr.decode()}")
         return None
     except Exception as e:
-        print(f"Konvertatsiya xatosi: {e}")
+        logging.error(f"Konvertatsiya jarayonida kutilmagan xato: {e}")
         return None
-# --- [Avvalgi kodning qolgan qismi (States, Keyboards, Handlers) bu yerga o'zgarishsiz keladi] ---
-# Faqat 'process_file_handler' ga fayl hajmi cheklovi qo'shiladi
 
-# --- STATE LAR (O'zgarishsiz qoldi) ---
+# --- STATE LAR ---
 class ConvertState(StatesGroup):
     waiting_for_file = State()
 
@@ -233,7 +227,7 @@ class WithdrawState(StatesGroup):
 class BroadcastState(StatesGroup):
     waiting_for_message = State()
 
-# --- KLAVIATURALAR (O'zgarishsiz qoldi) ---
+# --- KLAVIATURALAR ---
 main_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🔄 Konvertatsiya"), KeyboardButton(text="💰 Balansim")],
@@ -258,7 +252,6 @@ deposit_keyboard = ReplyKeyboardMarkup(
 
 
 # --- HANDLERLAR (ADMIN) ---
-# ... (Admin buyruqlari avvalgi koddan o'zgarishsiz) ...
 @dp.message(Command("admin"))
 async def admin_menu(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
@@ -350,7 +343,6 @@ async def admin_withdraw_check(message: types.Message):
                 parse_mode="Markdown"
             )
             
-            # Referal balansni 0 ga tushirish
             conn = get_db_connection()
             cur = conn.cursor()
             cur.execute("UPDATE user_stats SET referral_balance = 0 WHERE user_id = %s", (user_id,))
@@ -454,12 +446,10 @@ async def process_file_handler(message: types.Message, state: FSMContext):
     doc = message.document
     file_extension = doc.file_name.split('.')[-1].lower()
     
-    # 🚨 XAVFSIZLIK: Fayl kengaytmasini tekshirish
     if file_extension not in [file_type]:
         await message.answer(f"❌ Noto'g'ri fayl turi. Iltimos, **.{file_type}** fayl yuboring.", reply_markup=convert_menu)
         return
         
-    # 🚨 XAVFSIZLIK: Fayl hajmi cheklovi
     file_size_mb = doc.file_size / (1024 * 1024)
     if file_size_mb > MAX_FILE_SIZE_MB:
         await message.answer(f"❌ Fayl hajmi juda katta ({file_size_mb:.2f} MB). Maksimal ruxsat etilgan hajm: {MAX_FILE_SIZE_MB} MB.", reply_markup=convert_menu)
@@ -512,8 +502,7 @@ async def process_file_handler(message: types.Message, state: FSMContext):
         if 'output_path' in locals() and output_path and os.path.exists(output_path):
             os.remove(output_path)
 
-# --- HANDLERLAR (PUL YECHISH/REFERAL) ---
-# ... (Qolgan referal va pul yechish handlerlari avvalgi koddan o'zgarishsiz) ...
+# --- QOLGAN HANDLERLAR ---
 @dp.message(F.text == "💰 Balansim")
 async def balance_handler(message: types.Message):
     user_stat = get_user_stat(message.from_user.id)
@@ -654,7 +643,7 @@ async def process_withdrawal_card(message: types.Message, state: FSMContext):
     
     await message.answer("✅ Pul yechish so'rovingiz adminlarga yuborildi. Tez orada pulingiz o'tkaziladi. Bosh menyuga qaytildi.", reply_markup=main_menu)
     await state.clear()
-# --- BOSHQA HANDLERLAR ---
+    
 @dp.message(F.text == "ℹ️ Yordam")
 async def help_handler(message: types.Message):
     text = ("❓ **Yordam Bo'limi**\n\n"
@@ -669,34 +658,41 @@ async def help_handler(message: types.Message):
 async def ads_handler(message: types.Message):
     await message.answer("Reklama xizmatlari bo'yicha admin (@Sizning_adminingiz) bilan bog'laning.")
 
-# --- BOTNI ISHGA TUSHIRISH (WEBHOOK) ---
+# --- BOTNI ISHGA TUSHIRISH (WEBHOOK FUNKSIYALARI) ---
 async def on_startup(dispatcher):
+    # Dastur ishga tushganda bazani yaratish
+    init_db() 
+    # Webhookni Telegramga o'rnatish
     await bot.set_webhook(WEBHOOK_URL)
     logging.info(f"Webhook o'rnatildi: {WEBHOOK_URL}")
 
 async def on_shutdown(dispatcher):
+    # Dastur to'xtatilganda Webhookni o'chirish
     await bot.delete_webhook()
 
 def create_app():
-    init_db()
-
+    # Bu funktsiya Uvicorn uchun ASGI ilovasini yaratadi (aiohttp)
     app = web.Application()
     
+    # Webhook so'rovini aiogram dispatcherga yo'naltirish
     app.router.add_post(WEBHOOK_PATH, lambda request: telegram_webhook(request, dp))
     
+    # Ishga tushirish/o'chirish jarayonlari
     app.on_startup.append(lambda app: on_startup(dp))
     app.on_shutdown.append(lambda app: on_shutdown(dp))
     
     return app
 
 async def telegram_webhook(request, dispatcher):
+    # Telegramdan kelgan JSON so'rovini olish va aiogram dispatcherga uzatish
     update = Update.model_validate(await request.json(), context={'bot': dispatcher.bot})
     await dispatcher.feed_update(update)
     return web.Response()
 
-# Gunicorn shu 'app' ni chaqiradi
+# Uvicorn tomonidan chaqiriladigan asosiy obyekt
 app = create_app()
 
+# Lokal test uchun (Railwayda ishlamaydi)
 if __name__ == '__main__':
     logging.warning("Starting bot in local polling mode...")
     async def start_polling():
