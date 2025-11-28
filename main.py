@@ -339,7 +339,7 @@ async def process_file(message: types.Message, state: FSMContext):
             f"Fayl hajmi: {file_size_mb:.2f} MB\n"
             f"Xizmat narxi: <b>{price} UZS</b>\n\n"
             f"Iltimos, quyidagi kartaga to'lov qiling va chek rasmini (skrinshot) shu yerga yuboring:\n"
-            f"💳 <code>8600 0000 0000 0000</code> (Ism F.)\n", # Karta raqamini o'zgartiring
+            f"💳 <code>5614 6812 9088 6526</code> (Abdulaziz To'lqinov)\n", # Karta raqamini o'zgartiring
             parse_mode="HTML"
         )
         await state.set_state(ConvertState.waiting_for_payment)
