@@ -4,7 +4,8 @@ import asyncio
 import datetime
 import subprocess
 import json
-import re # Pul yechish uchun karta raqamini tekshirishga
+import re 
+import time
 
 from io import BytesIO
 import psycopg2
@@ -15,6 +16,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, LabeledPrice, PreCheckoutQuery, SuccessfulPayment
+from aiogram.dispatcher.middlewares.base import BaseMiddleware # Middleware uchun
+from typing import Callable, Awaitable, Any, Dict # Middleware uchun
 
 # Veb-server uchun kutubxonalar
 from aiohttp import web
@@ -30,13 +33,16 @@ BASE_WEBHOOK_URL = os.getenv("BASE_WEBHOOK_URL")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}"
 
-# BotFather orqali olingan Payment Token (Test/Ishchi)
 PAYMENT_TOKEN = os.getenv("PAYMENT_TOKEN")
 
 MIN_DEPOSIT_UZS = 5000 
 MIN_WITHDRAWAL_UZS = 5000 
 REFERRAL_BONUS_UZS = 500 
-CONVERSION_PRICE_PER_MB = 1300 # Har bir konvertatsiya uchun minimal narx (1MB gacha)
+CONVERSION_PRICE_PER_MB = 1300
+
+# --- XAVFSIZLIK SOZLAMALARI ---
+MAX_FILE_SIZE_MB = 100  # Maksimal fayl hajmi 100 MB
+FLOOD_CONTROL_RATE = 1.0  # Bir foydalanuvchidan xabarni qabul qilish oralig'i (sekundda)
 
 # Agar asosiy o'zgaruvchilar yo'q bo'lsa, xato berish
 if not all([BOT_TOKEN, ADMIN_ID, DATABASE_URL, BASE_WEBHOOK_URL, PAYMENT_TOKEN]):
@@ -48,15 +54,50 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 logging.basicConfig(level=logging.INFO)
 
+# --- XAVFSIZLIK: FLOOD CONTROL MIDDLEWARE ---
+class AntiFloodMiddleware(BaseMiddleware):
+    def __init__(self, rate_limit: float = FLOOD_CONTROL_RATE):
+        self.rate_limit = rate_limit
+        self.users = {}
+
+    async def __call__(
+        self,
+        handler: Callable[[types.Message, Dict[str, Any]], Awaitable[Any]],
+        event: types.Message,
+        data: Dict[str, Any],
+    ) -> Any:
+        user_id = event.from_user.id
+        current_time = time.time()
+        
+        # Agar foydalanuvchi birinchi marta yozayotgan bo'lsa
+        if user_id not in self.users:
+            self.users[user_id] = current_time
+            return await handler(event, data)
+        
+        # Oxirgi xabar bilan joriy xabar o'rtasidagi farq
+        time_since_last_message = current_time - self.users[user_id]
+
+        if time_since_last_message < self.rate_limit:
+            # Cheklovni buzdi
+            await event.answer("⚠️ Iltimos, sekinroq yozing. Bot serverini himoya qilyapmiz.")
+            return # Handler ishga tushmaydi
+        
+        # Vaqtni yangilash
+        self.users[user_id] = current_time
+        return await handler(event, data)
+
+dp.message.middleware(AntiFloodMiddleware())
+
 # --- BAZA BILAN ISHLASH (O'zgarishsiz qoldi) ---
-# ... init_db, check_reset_weekly, get_user_stat, update_stat_and_balance funksiyalari ...
+# ... get_db_connection, init_db, check_reset_weekly, get_user_stat, update_stat_and_balance funksiyalari ...
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+# ... [Qolgan barcha funksiyalar (init_db, check_reset_weekly, get_user_stat, update_stat_and_balance, deposit_balance, calculate_price, convert_to_pdf) avvalgi kod bilan bir xil joylashadi] ...
+# Bu yerga avvalgi kodning barcha funksiyalarini joylashtiring.
 
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
-    # Foydalanuvchilar jadvali
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
@@ -66,7 +107,6 @@ def init_db():
             joined_at TIMESTAMP DEFAULT NOW()
         )
     """)
-    # Limitlar va statistika jadvali
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_stats (
             user_id BIGINT PRIMARY KEY REFERENCES users(user_id),
@@ -134,15 +174,12 @@ def update_stat_and_balance(user_id, file_type, is_paid, amount=0):
     cur.close()
     conn.close()
 
-# Balansni to'ldirish funksiyasi (Referal bonusni ham o'z ichiga oladi)
 def deposit_balance(user_id, amount):
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # 1. Asosiy balansga pul qo'shish
     cur.execute("UPDATE user_stats SET balance = balance + %s WHERE user_id = %s", (amount, user_id))
     
-    # 2. Referal bonus shartini tekshirish
     if amount >= MIN_DEPOSIT_UZS:
         cur.execute("SELECT referrer_id FROM users WHERE user_id = %s", (user_id,))
         referrer_row = cur.fetchone()
@@ -157,13 +194,10 @@ def deposit_balance(user_id, amount):
     conn.close()
     
 def calculate_price(size_mb):
-    # Bu funksiya avvalgi shartlarga muvofiq qayta tiklandi
-    # 20MB gacha va 20MB dan yuqori bo'lsa
     if size_mb <= 20:
-        # 1MB gacha (yoki aniqrog'i 1MB) uchun minimal 1300 UZS.
         price = (size_mb * 300) + 1000
         if price < CONVERSION_PRICE_PER_MB: 
-            price = CONVERSION_PRICE_PER_MB # 1300 UZS minimal narx
+            price = CONVERSION_PRICE_PER_MB 
     else:
         price = (size_mb * 500) + 1000
     return int(price)
@@ -183,7 +217,8 @@ async def convert_to_pdf(input_path, output_dir):
     except Exception as e:
         print(f"Konvertatsiya xatosi: {e}")
         return None
-
+# --- [Avvalgi kodning qolgan qismi (States, Keyboards, Handlers) bu yerga o'zgarishsiz keladi] ---
+# Faqat 'process_file_handler' ga fayl hajmi cheklovi qo'shiladi
 
 # --- STATE LAR (O'zgarishsiz qoldi) ---
 class ConvertState(StatesGroup):
@@ -199,8 +234,6 @@ class BroadcastState(StatesGroup):
     waiting_for_message = State()
 
 # --- KLAVIATURALAR (O'zgarishsiz qoldi) ---
-# ... main_menu, convert_menu, deposit_keyboard ...
-
 main_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🔄 Konvertatsiya"), KeyboardButton(text="💰 Balansim")],
@@ -223,8 +256,9 @@ deposit_keyboard = ReplyKeyboardMarkup(
     ], resize_keyboard=True
 )
 
-# --- HANDLERLAR (ADMIN) ---
 
+# --- HANDLERLAR (ADMIN) ---
+# ... (Admin buyruqlari avvalgi koddan o'zgarishsiz) ...
 @dp.message(Command("admin"))
 async def admin_menu(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
@@ -296,7 +330,6 @@ async def admin_send_broadcast(message: types.Message, state: FSMContext):
 
 @dp.message(F.reply_to_message.is_attribute('text'))
 async def admin_withdraw_check(message: types.Message):
-    # Pul yechishni qo'lda tasdiqlash
     if message.from_user.id != ADMIN_ID or not message.photo:
         return
 
@@ -331,23 +364,15 @@ async def admin_withdraw_check(message: types.Message):
             await message.answer(f"❌ Xatolik yuz berdi: {e}")
 
 # --- HANDLERLAR (TELEGRAM PAYMENT) ---
-# Pre-Checkout Query (Foydalanuvchi to'lovni tasdiqlashdan oldingi oxirgi tekshiruv)
 @dp.pre_checkout_query(lambda query: True)
 async def pre_checkout_handler(pre_checkout_query: PreCheckoutQuery):
     await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
-    logging.info(f"Pre-Checkout tasdiqlandi: {pre_checkout_query.from_user.id}")
 
-
-# Successful Payment (Muvaffaqiyatli to'lov)
 @dp.message(F.successful_payment)
 async def successful_payment_handler(message: types.Message):
     payment: SuccessfulPayment = message.successful_payment
-    
-    # Pul miqdorini olish (UZS da, tiyinlarda keladi, shuning uchun 100 ga bo'lamiz)
     amount_uzs = payment.total_amount / 100 
     user_id = message.from_user.id
-    
-    # Balansni to'ldirish (Referal bonusni ham o'z ichiga oladi)
     deposit_balance(user_id, int(amount_uzs))
     
     await message.answer(
@@ -356,7 +381,6 @@ async def successful_payment_handler(message: types.Message):
         parse_mode="Markdown",
         reply_markup=main_menu
     )
-    logging.info(f"Muvaffaqiyatli to'lov: User {user_id}, {amount_uzs} UZS")
 
 # --- HANDLERLAR (ASOSIY & CONVERSION) ---
 @dp.message(CommandStart())
@@ -366,7 +390,6 @@ async def start_handler(message: types.Message):
     username = message.from_user.username
     referrer_id = None
     
-    # Referal linkni tekshirish (masalan: /start ref_12345)
     if message.text and len(message.text.split()) > 1:
         param = message.text.split()[1]
         if param.startswith("ref_") and param[4:].isdigit():
@@ -377,7 +400,6 @@ async def start_handler(message: types.Message):
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # Foydalanuvchini bazaga qo'shish
     cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
     if not cur.fetchone():
         cur.execute("""
@@ -385,9 +407,7 @@ async def start_handler(message: types.Message):
             VALUES (%s, %s, %s, %s)
         """, (user_id, full_name, username, referrer_id))
         
-        # Statikani yaratish
         cur.execute("INSERT INTO user_stats (user_id) VALUES (%s)", (user_id,))
-        
         conn.commit()
 
     cur.close()
@@ -417,10 +437,8 @@ async def ask_for_file_handler(message: types.Message, state: FSMContext):
     user_stat = get_user_stat(user_id)
     
     if user_stat[f'free_{file_key}']:
-        # Bepul limit mavjud
         await message.answer(f"Haftalik **{file_name}** fayl uchun bepul konvertatsiya limiti mavjud.\nIltimos, faylni yuboring.")
     else:
-        # Pullik
         await message.answer(f"Haftalik **{file_name}** fayl uchun bepul limit tugagan.\nIltimos, konvertatsiya qilinishi kerak bo'lgan faylni yuboring. Konvertatsiya pulga amalga oshiriladi (narx hajmdan kelib chiqib hisoblanadi).")
     
     await state.set_state(ConvertState.waiting_for_file)
@@ -436,17 +454,21 @@ async def process_file_handler(message: types.Message, state: FSMContext):
     doc = message.document
     file_extension = doc.file_name.split('.')[-1].lower()
     
+    # 🚨 XAVFSIZLIK: Fayl kengaytmasini tekshirish
     if file_extension not in [file_type]:
         await message.answer(f"❌ Noto'g'ri fayl turi. Iltimos, **.{file_type}** fayl yuboring.", reply_markup=convert_menu)
         return
-
-    # Fayl hajmini tekshirish (MB ga o'tkazish)
+        
+    # 🚨 XAVFSIZLIK: Fayl hajmi cheklovi
     file_size_mb = doc.file_size / (1024 * 1024)
+    if file_size_mb > MAX_FILE_SIZE_MB:
+        await message.answer(f"❌ Fayl hajmi juda katta ({file_size_mb:.2f} MB). Maksimal ruxsat etilgan hajm: {MAX_FILE_SIZE_MB} MB.", reply_markup=convert_menu)
+        return
+
     price = calculate_price(file_size_mb)
     user_id = message.from_user.id
     user_stat = get_user_stat(user_id)
 
-    # Bepul / Pullik variantni aniqlash
     if user_stat[f'free_{file_type}']:
         is_paid = False
         status_text = "Bepul"
@@ -461,11 +483,9 @@ async def process_file_handler(message: types.Message, state: FSMContext):
     await message.answer(f"⏳ Faylingizni (Hajmi: {file_size_mb:.2f} MB, Konvertatsiya: {status_text}) qayta ishlayapman...")
 
     try:
-        # Faylni yuklab olish
         file_info = await bot.get_file(doc.file_id)
         downloaded_file = await bot.download_file(file_info.file_path)
 
-        # Faylni diskka yozish (soffice konvertatsiya qilishi uchun)
         temp_dir = 'temp'
         os.makedirs(temp_dir, exist_ok=True)
         input_path = os.path.join(temp_dir, doc.file_name)
@@ -473,15 +493,12 @@ async def process_file_handler(message: types.Message, state: FSMContext):
         with open(input_path, 'wb') as f:
             f.write(downloaded_file.read())
 
-        # Konvertatsiya
         output_path = await convert_to_pdf(input_path, temp_dir)
 
         if output_path:
-            # Faylni foydalanuvchiga yuborish
             pdf_file = FSInputFile(output_path)
             await message.answer_document(pdf_file, caption="✅ Konvertatsiya muvaffaqiyatli yakunlandi!")
             
-            # Balansni yangilash
             update_stat_and_balance(user_id, file_type, is_paid, price)
         else:
             await message.answer("❌ Konvertatsiya amalga oshmadi. Fayl shikastlangan bo'lishi mumkin yoki ichida ma'lumot yo'q.")
@@ -490,14 +507,76 @@ async def process_file_handler(message: types.Message, state: FSMContext):
         logging.error(f"Konvertatsiya jarayonida kutilmagan xato: {e}")
         await message.answer("❌ Serverda kutilmagan xato ro'y berdi. Keyinroq urinib ko'ring.")
     finally:
-        # Vaqtinchalik fayllarni o'chirish
         if 'input_path' in locals() and os.path.exists(input_path):
             os.remove(input_path)
         if 'output_path' in locals() and output_path and os.path.exists(output_path):
             os.remove(output_path)
 
-
 # --- HANDLERLAR (PUL YECHISH/REFERAL) ---
+# ... (Qolgan referal va pul yechish handlerlari avvalgi koddan o'zgarishsiz) ...
+@dp.message(F.text == "💰 Balansim")
+async def balance_handler(message: types.Message):
+    user_stat = get_user_stat(message.from_user.id)
+    balance = user_stat['balance']
+    
+    text = (f"💵 <b>Balansingiz: {balance} UZS</b>\n\n"
+            "Bu mablag'ni pullik konvertatsiyalar uchun ishlatishingiz mumkin.")
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Balansni to'ldirish", callback_data="deposit_start")]
+    ])
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+@dp.callback_query(F.data == "deposit_start")
+async def start_deposit(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.delete()
+    await callback.message.answer("💳 Qancha pul to'ldirmoqchisiz? Minimal to'lov summasi: 5000 UZS", reply_markup=deposit_keyboard)
+    await state.set_state(PayState.waiting_for_deposit_amount)
+    await callback.answer()
+
+@dp.message(PayState.waiting_for_deposit_amount)
+async def get_deposit_amount(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    
+    if message.text == "🔙 Bosh menyu":
+        await state.clear()
+        await message.answer("Bosh menyuga qaytildi.", reply_markup=main_menu)
+        return
+
+    try:
+        if message.text in ["5000 UZS", "10000 UZS"]:
+            amount = int(message.text.split()[0])
+        else:
+            amount = int(message.text)
+
+        if amount < MIN_DEPOSIT_UZS:
+            await message.answer(f"❌ Minimal to'lov summasi {MIN_DEPOSIT_UZS} UZS bo'lishi kerak. Iltimos, kattaroq summa kiriting.")
+            return
+
+        amount_cents = amount * 100 
+
+        await bot.send_invoice(
+            chat_id=user_id,
+            title=f"Balansni to'ldirish",
+            description=f"Konvertatsiya xizmatlari uchun {amount} UZS to'ldirish.",
+            payload=f"deposit_{user_id}_{amount}", 
+            provider_token=PAYMENT_TOKEN,
+            currency="UZS",
+            prices=[
+                LabeledPrice(label=f"Balansni to'ldirish", amount=amount_cents)
+            ],
+            start_parameter=f"deposit_{user_id}",
+            need_name=False,
+            need_email=False,
+            is_flexible=False
+        )
+        await state.clear() 
+
+    except ValueError:
+        await message.answer("❌ Noto'g'ri qiymat. Iltimos, faqat raqam kiriting.")
+    except Exception as e:
+        await message.answer(f"❌ Xatolik: To'lov tizimida muammo yuz berdi. Iltimos, tekshirib ko'ring. {e}")
+
 
 @dp.message(F.text == "🤝 Referal")
 async def referral_handler(message: types.Message):
@@ -552,7 +631,6 @@ async def process_withdrawal_card(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     card_number = message.text.replace(' ', '')
     
-    # Karta raqamini tekshirish (16 xona raqam)
     if not re.match(r'^\d{16}$', card_number):
         await message.answer("❌ Karta raqami noto'g'ri formatda. Iltimos, 16 xonali raqamni to'g'ri kiriting:")
         return
@@ -565,7 +643,6 @@ async def process_withdrawal_card(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
-    # Admin paneliga pul yechish so'rovini yuborish
     admin_message = (f"💸 **Yangi Pul Yechish So'rovi!**\n\n"
                      f"USER_ID: {user_id}\n"
                      f"Foydalanuvchi: {message.from_user.full_name}\n"
@@ -577,7 +654,6 @@ async def process_withdrawal_card(message: types.Message, state: FSMContext):
     
     await message.answer("✅ Pul yechish so'rovingiz adminlarga yuborildi. Tez orada pulingiz o'tkaziladi. Bosh menyuga qaytildi.", reply_markup=main_menu)
     await state.clear()
-
 # --- BOSHQA HANDLERLAR ---
 @dp.message(F.text == "ℹ️ Yordam")
 async def help_handler(message: types.Message):
@@ -592,7 +668,6 @@ async def help_handler(message: types.Message):
 @dp.message(F.text == "📢 Reklama Xizmati")
 async def ads_handler(message: types.Message):
     await message.answer("Reklama xizmatlari bo'yicha admin (@Sizning_adminingiz) bilan bog'laning.")
-
 
 # --- BOTNI ISHGA TUSHIRISH (WEBHOOK) ---
 async def on_startup(dispatcher):
