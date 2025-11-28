@@ -41,10 +41,10 @@ REFERRAL_BONUS_UZS = 500
 CONVERSION_PRICE_PER_MB = 1300
 
 # --- XAVFSIZLIK SOZLAMALARI ---
-MAX_FILE_SIZE_MB = 100  # Maksimal fayl hajmi 100 MB
-FLOOD_CONTROL_RATE = 1.0  # Bir foydalanuvchidan xabarni qabul qilish oralig'i (sekundda)
+MAX_FILE_SIZE_MB = 100 
+FLOOD_CONTROL_RATE = 1.0  
 
-# Muhit o'zgaruvchilari tekshiruvi (eng muhim himoya)
+# Muhit o'zgaruvchilari tekshiruvi
 if not all([BOT_TOKEN, ADMIN_ID, DATABASE_URL, BASE_WEBHOOK_URL, PAYMENT_TOKEN]):
     logging.error("Muhit o'zgaruvchilari to'liq kiritilmagan! Bot ishga tushirilmaydi.")
     exit(1)
@@ -197,7 +197,6 @@ def calculate_price(size_mb):
 
 async def convert_to_pdf(input_path, output_dir):
     try:
-        # LibreOffice/soffice konvertatsiyasi
         process = subprocess.run(
             ['soffice', '--headless', '--convert-to', 'pdf', '--outdir', output_dir, input_path],
             stdout=subprocess.PIPE,
@@ -207,7 +206,6 @@ async def convert_to_pdf(input_path, output_dir):
             filename = os.path.basename(input_path)
             pdf_filename = filename.rsplit('.', 1)[0] + '.pdf'
             return os.path.join(output_dir, pdf_filename)
-        # Agar xato bo'lsa, loglarga yozish
         logging.error(f"Soffice xato kodi: {process.returncode}, Stderr: {process.stderr.decode()}")
         return None
     except Exception as e:
@@ -659,40 +657,34 @@ async def ads_handler(message: types.Message):
     await message.answer("Reklama xizmatlari bo'yicha admin (@Sizning_adminingiz) bilan bog'laning.")
 
 # --- BOTNI ISHGA TUSHIRISH (WEBHOOK FUNKSIYALARI) ---
+
 async def on_startup(dispatcher):
     # Dastur ishga tushganda bazani yaratish
     init_db() 
-    # Webhookni Telegramga o'rnatish
-    await bot.set_webhook(WEBHOOK_URL)
+    # Webhookni Telegramga o'rnatish, avvalgi o'qilmagan xabarlarni o'chirib tashlash
+    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True) 
     logging.info(f"Webhook o'rnatildi: {WEBHOOK_URL}")
 
 async def on_shutdown(dispatcher):
-    # Dastur to'xtatilganda Webhookni o'chirish
     await bot.delete_webhook()
 
 def create_app():
-    # Bu funktsiya Uvicorn uchun ASGI ilovasini yaratadi (aiohttp)
     app = web.Application()
     
-    # Webhook so'rovini aiogram dispatcherga yo'naltirish
     app.router.add_post(WEBHOOK_PATH, lambda request: telegram_webhook(request, dp))
     
-    # Ishga tushirish/o'chirish jarayonlari
     app.on_startup.append(lambda app: on_startup(dp))
     app.on_shutdown.append(lambda app: on_shutdown(dp))
     
     return app
 
 async def telegram_webhook(request, dispatcher):
-    # Telegramdan kelgan JSON so'rovini olish va aiogram dispatcherga uzatish
     update = Update.model_validate(await request.json(), context={'bot': dispatcher.bot})
     await dispatcher.feed_update(update)
     return web.Response()
 
-# Uvicorn tomonidan chaqiriladigan asosiy obyekt
 app = create_app()
 
-# Lokal test uchun (Railwayda ishlamaydi)
 if __name__ == '__main__':
     logging.warning("Starting bot in local polling mode...")
     async def start_polling():
