@@ -4,5 +4,5 @@ pytesseract
 Pillow
 python-docx
 openpyxl
-pptx
+python-pptx  <-- Bu qator to'g'rilandi
 python-dotenv
