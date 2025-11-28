@@ -1,9 +1,6 @@
-aiogram==3.10.0
-psycopg2-binary
-Pillow
-python-docx
-openpyxl
-python-pptx
-python-dotenv
+aiogram==3.*
 aiohttp
+psycopg2-binary
 gunicorn
+uvicorn
+python-dotenv
