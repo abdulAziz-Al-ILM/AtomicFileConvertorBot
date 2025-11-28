@@ -1,23 +1,23 @@
-# Python asosini olamiz
+# 1-qadam: Asosiy bazaviy tasvir
 FROM python:3.10-slim
 
-# Kerakli tizim dasturlarini o'rnatamiz (LibreOffice va PostgreSQL kutubxonalari)
+# 2-qadam: Konvertatsiya uchun LibreOffice ni o'rnatish
+# LibreOffice o'rnatish uchun zarur bo'lgan paketlar
 RUN apt-get update && apt-get install -y \
     libreoffice \
-    libpq-dev \
-    gcc \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Ishchi papkani belgilaymiz
-WORKDIR /app
+# 3-qadam: Loyiha katalogini yaratish
+WORKDIR /usr/src/app
 
-# Kutubxonalarni o'rnatamiz
+# 4-qadam: Python paketlarini o'rnatish
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Bot kodini ko'chiramiz
+# 5-qadam: Loyiha fayllarini qo'shish
 COPY . .
 
-# Botni veb-server rejimida ishga tushiramiz.
-# Bu sintaksis gunicornni $PORT muhit o'zgaruvchisiga bog'lash uchun eng ishonchli variantdir.
-CMD gunicorn main:app -w 4 -b 0.0.0.0:"$PORT"
+# 6-qadam: Konteyner ishga tushganda bajariladigan buyruq
+# Uvicorn (ASGI server) yordamida ilovani ishga tushirish (Webhook xatosini hal qilish uchun)
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "4"]
