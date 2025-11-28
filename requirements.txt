@@ -1,6 +1,5 @@
 aiogram==3.10.0
 psycopg2-binary
-pytesseract
 Pillow
 python-docx
 openpyxl
